@@ -14,6 +14,8 @@ import sys
 import struct
 import datetime
 import os
+import math
+import mmap
 
 import mando
 from mando.rst_text_formatter import RSTHelpFormatter
@@ -642,6 +644,95 @@ def extract(filename, *labels):
     result = pd.concat(jtsd, axis=1, join_axes=[jtsd[0].index])
     return tsutils.printiso(result)
 
+def fast_extract(filename, *labels):
+    """Get the time series data for a particular object and variable.
+
+    Parameters
+    ----------
+    {filename}
+    {labels}
+
+    """
+    obj = SwmmExtract(filename)
+    begindate = datetime.datetime(1899, 12, 30)
+    namemap = {
+        0 : 'subcatchment',
+        1 : 'node',
+        2 : 'link',
+        4 : 'system'
+    }
+    typemap = {
+        0 : 0,
+        1 : int(obj.RECORDSIZE * obj.swmm_nsubcatch * obj.swmm_nsubcatchvars),
+        2 : int(obj.RECORDSIZE * obj.swmm_nsubcatch * obj.swmm_nsubcatchvars +
+                obj.RECORDSIZE * obj.swmm_nnodes * obj.nnodevars),
+        4 : int(obj.RECORDSIZE * obj.swmm_nsubcatch * obj.swmm_nsubcatchvars +
+                obj.RECORDSIZE * obj.swmm_nnodes * obj.nnodevars +
+                obj.RECORDSIZE * obj.swmm_nlinks * obj.nlinkvars),
+    }
+    varmap = {
+        0 : obj.swmm_nsubcatchvars,
+        1 : obj.nnodevars,
+        2 : obj.nlinkvars,
+        4 : obj.nsystemvars,
+    }
+    labels = pd.Series(labels).str.split(',')
+    itypename = labels.str[0]
+    item_names = labels.str[1].values
+    varix = labels.str[2].astype(int)
+    itypes = itypename.map({v: k for k, v in namemap.items()}).values
+    itemindices = []
+    for name in item_names:
+        _, itemindex = obj.name_check(1, name)
+        itemindices.append(itemindex)
+    item_name_map = pd.Series(item_names, index=itemindices)
+    item_name_map = item_name_map[~item_name_map.index.duplicated(keep='first')]
+    items = pd.np.asarray(itemindices)
+    periods = pd.np.arange(obj.swmm_nperiods + 1)
+    date_offsets = obj.startpos + periods * obj.bytesperperiod
+    offsets = date_offsets + 2 * obj.RECORDSIZE
+    type_offsets = pd.Series(itypes).map(typemap).values
+    item_offsets = items * pd.Series(itypes).map(varmap).values * obj.RECORDSIZE
+    var_offsets = varix * obj.RECORDSIZE
+    all_offsets = type_offsets + item_offsets + var_offsets
+    bool_mask = pd.np.zeros(obj.bytesperperiod - 2).astype(bool)
+    record_mask = bool_mask.copy()
+    record_mask[all_offsets] = 1
+    for i in range(obj.RECORDSIZE):
+        bool_mask[all_offsets + i] = 1
+    ts = []
+    for start_ix, end_ix in zip(periods[:-1], periods[:-1] + 1):
+        mmap_offset = (mmap.ALLOCATIONGRANULARITY *
+                       math.floor(offsets[start_ix] /
+                                  mmap.ALLOCATIONGRANULARITY))
+        mmap_endpoint = offsets[end_ix] - 2
+        mmap_length = mmap_endpoint - mmap_offset
+        assert((mmap_offset % mmap.ALLOCATIONGRANULARITY) == 0)
+        mmap_start_gap = offsets[start_ix] - mmap_offset
+        mmap_end_gap = mmap_endpoint - (offsets[end_ix] - 2)
+        mmap_bool_mask = pd.np.pad(bool_mask, pad_width=(mmap_start_gap, mmap_end_gap),
+                                   mode='constant', constant_values=0)
+        mmap_fp = mmap.mmap(obj.fp.fileno(), prot=mmap.PROT_READ,
+                            length=mmap_length, offset=mmap_offset)
+        records = pd.np.array(mmap_fp)[mmap_bool_mask].reshape(-1, obj.RECORDSIZE)
+        records = records.view(dtype=pd.np.float32).ravel()
+        ts.append(records)
+    dates = []
+    for date in date_offsets[:-1]:
+        obj.fp.seek(date, 0)
+        date = struct.unpack('d', obj.fp.read(2 * obj.RECORDSIZE))[0]
+        dates.append(date)
+    record_order = (pd.DataFrame(pd.np.column_stack([itypes, items, varix]))
+                    .sort_values(by=[0,1,2]))
+    record_type_names = record_order[0].map(namemap).astype(str)
+    record_item_names = record_order[1].map(item_name_map).astype(str)
+    record_var_names = pd.concat([record_order[2][record_order[0] == i]
+                                  .map(VARCODE[i]) for i in
+                                VARCODE]).sort_index().astype(str)
+    headings = record_type_names + '_' + record_item_names + '_' + record_var_names
+    date_index = pd.to_datetime(dates, unit='d', origin=begindate)
+    result = pd.DataFrame(pd.np.vstack(ts), index=date_index, columns=headings)
+    return result
 
 @tsutils.doc(_LOCAL_DOCSTRINGS)
 def extract_arr(filename, *labels):
