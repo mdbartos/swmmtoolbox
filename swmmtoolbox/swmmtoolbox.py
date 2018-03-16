@@ -682,8 +682,8 @@ def fast_extract(filename, *labels):
     varix = labels.str[2].astype(int)
     itypes = itypename.map({v: k for k, v in namemap.items()}).values
     itemindices = []
-    for name in item_names:
-        _, itemindex = obj.name_check(1, name)
+    for dtype, name in zip(itypes, item_names):
+        _, itemindex = obj.name_check(dtype, name)
         itemindices.append(itemindex)
     item_name_map = pd.Series(item_names, index=itemindices)
     item_name_map = item_name_map[~item_name_map.index.duplicated(keep='first')]
